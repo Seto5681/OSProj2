@@ -11,8 +11,6 @@
 #define MAX_PASSWORDS 10000000
 #define NUM_THREADS 6
 
-#define HASH_TABLE_SIZE 100003  // A prime number
-
 
 struct node {
     char* key;
@@ -131,10 +129,13 @@ void *worker(void *arg) {
         char *password = passwords[idx];
         for (int i = 0; i < n_algs; i++) {
             unsigned char *hash = fn[i]((unsigned char *)password, strlen(password));
-            for (int j = 0; j < KEEP; j++)
-                sprintf(&hex_hash[2 * j], "%02x", hash[j]);
+            const char hex_chars[] = "0123456789abcdef";
+            for (int j = 0; j < KEEP; j++) {
+                hex_hash[2 * j] = hex_chars[(hash[j] >> 4) & 0xF];
+                hex_hash[2 * j + 1] = hex_chars[hash[j] & 0xF];
+            }
             hex_hash[2 * KEEP] = '\0';
-            
+                        
             struct node* found = search(mp, hex_hash);
             if (found != NULL && found->password == NULL){
                 pthread_mutex_lock(&lock);
