@@ -1,10 +1,13 @@
-// Multithreaded version of crack_hashed_passwords()
+// Modified password cracking code with threads. Uses 6 threads
+// to distribute the workload of processing the passwords, each
+// thread processes 1/6th of the passwords.
+// Uses map data structure to reduce the cracked hash lookup time
+// Instead of sprintf uses a hex function for faster hash generation
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
 #include <pthread.h>
-
 #include "hash_functions.h"
 
 #define KEEP 16
@@ -12,6 +15,7 @@
 #define NUM_THREADS 6
 
 
+// Implementation of map data sturcture
 struct node {
     char* key;
     char* password;
@@ -19,7 +23,6 @@ struct node {
     struct node* next;
 };
  
-
 void setNode(struct node* node, char* key, char* value1, char* value2)
 {
     node->key = key;
@@ -28,13 +31,16 @@ void setNode(struct node* node, char* key, char* value1, char* value2)
     node->next = NULL;
     return;
 };
+
+//dummy node for atomic execution purposes
+struct node NOT_FOUND = {NULL, "12", NULL, NULL};
  
 struct hashMap {
     int numOfElements, capacity;
     struct node** arr;
 };
  
-
+//initialization
 void initializeHashMap(struct hashMap* mp, int cap)
 {
     mp->capacity = cap;
@@ -42,7 +48,8 @@ void initializeHashMap(struct hashMap* mp, int cap)
     mp->arr = (struct node**)malloc(sizeof(struct node*)* mp->capacity);
     return;
 }
- 
+
+//hash fucntion
 int hashFunction(struct hashMap* mp, char* key)
 {
     int bucketIndex;
@@ -60,7 +67,8 @@ int hashFunction(struct hashMap* mp, char* key)
     bucketIndex = sum;
     return bucketIndex;
 }
- 
+
+// Inserting elements in the map
 void insert(struct hashMap* mp, char* key)
 {
     int bucketIndex = hashFunction(mp, key);
@@ -80,7 +88,8 @@ void insert(struct hashMap* mp, char* key)
     return;
 }
  
- 
+//Search function. If an entry with the key exists in the map, returns the entry
+//otherwise, returns NOT_FOUND(for being able to use compare and swap in the future)
 struct node* search(struct hashMap* mp, char* key)
 {
     int bucketIndex = hashFunction(mp, key);
@@ -91,15 +100,15 @@ struct node* search(struct hashMap* mp, char* key)
         }
         bucketHead = bucketHead->next;
     }
-    return NULL;  // Not found
+    return &NOT_FOUND;  // Not found
 }
-
-struct hashMap *mp;
 
 struct cracked_hash {
     char hash[2 * KEEP + 1];
     char *password, *alg;
 };
+
+struct hashMap *mp;
 
 typedef unsigned char *(*hashing)(unsigned char *, unsigned int);
 
@@ -107,10 +116,13 @@ int n_algs = 4;
 hashing fn[4] = {calculate_md5, calculate_sha1, calculate_sha256, calculate_sha512};
 char *algs[4] = {"MD5", "SHA1", "SHA256", "SHA512"};
 
+//initializing the lock
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 struct cracked_hash *cracked_hashes;
 int n_hashed = 0;
+
+//declaring the variable for 
 char **passwords;
 int n_passwords = 0;
 
@@ -120,30 +132,34 @@ int compare_hashes(char *a, char *b) {
     }
     return 1;
 }
-
+// Function name:  worker
+// Description:    Worker thread function. We will have 4-8 threads(however many is fastest, in this case, it was 6)
+//                 each worker thread processes a chunk of the passwords array. Since we have 6 threads, each will process
+//                 every 6th element
 void *worker(void *arg) {
     long tid = (long)arg;
     char hex_hash[2 * KEEP + 1];
+
 
     for (int idx = tid; idx < n_passwords; idx += NUM_THREADS) {
         char *password = passwords[idx];
         for (int i = 0; i < n_algs; i++) {
             unsigned char *hash = fn[i]((unsigned char *)password, strlen(password));
+            
+            //Generating the hash
             const char hex_chars[] = "0123456789abcdef";
             for (int j = 0; j < KEEP; j++) {
                 hex_hash[2 * j] = hex_chars[(hash[j] >> 4) & 0xF];
                 hex_hash[2 * j + 1] = hex_chars[hash[j] & 0xF];
             }
             hex_hash[2 * KEEP] = '\0';
-                        
+            
+            //Searching the map for the hash
             struct node* found = search(mp, hex_hash);
-            if (found != NULL && found->password == NULL){
-                pthread_mutex_lock(&lock);
-                if (found->password == NULL){
-                    found->password = strdup(password);
-                    found->alg = algs[i];
-                }
-                pthread_mutex_unlock(&lock);
+
+            //atomically updating the map
+            if (__sync_bool_compare_and_swap(&found->password, NULL, strdup(password))) {
+                found->alg = algs[i];
             }
             
             free(hash);
@@ -151,6 +167,15 @@ void *worker(void *arg) {
     }
     return NULL;
 }
+
+// Function name: crack_hashed_passwords
+// Description:   Modified password cracking function with threads. Loads cracked
+//                hashes into a map, and the password list into a password array.
+//                Creates 6 worker threads, each processing every 6th password.
+//                The workers hash the passwords according to different algoes,
+//                then look the hash up in the map that contains cracked hashes to decide 
+//                whether any of them matches this password. When multiple passwords
+//                match the same hash, only the first one in the list is printed.
 
 void crack_hashed_passwords(char *password_list, char *hashed_list, char *output) {
     FILE *fp;
@@ -169,7 +194,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
     }
     fclose(fp);
 
-    //load the hashes into a map for faster lookup
+    //Load the hashes into a map for faster lookup
     mp= (struct hashMap*)malloc(sizeof(struct hashMap));
     initializeHashMap(mp, 5000);
     for(int i = 0; i < n_hashed; i++){
@@ -190,10 +215,13 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
     for (long i = 0; i < NUM_THREADS; i++) {
         pthread_create(&threads[i], NULL, worker, (void *)i);
     }
+
+    //wait for threads to finish
     for (int i = 0; i < NUM_THREADS; i++) {
         pthread_join(threads[i], NULL);
     }
 
+    // Get the information from the map for correct output
     struct node* curnode;
     for(int i = 0; i < n_hashed; i++){
         curnode = search(mp, cracked_hashes[i].hash);
